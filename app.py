@@ -83,17 +83,6 @@ def load_url_list(spreadsheet) -> pd.DataFrame:
 
 
 # ── kacta.or.kr 파서 ─────────────────────────────────────────────────────────
-"""
-사이트 테이블 구조 (실측):
-<table> → <tr> 마다:
-  번호 | 성명 | 전화번호 | 팩스 | 개업구분(현황) | 주소
-
-목표 컬럼: 이름 / 전화번호 / 현황
-  - 이름: 2~4 한글 (성명 컬럼)
-  - 전화번호: 전화번호 컬럼 (비공개 포함)
-  - 현황: 개업 / 폐업 / 휴업 텍스트
-"""
-
 NAME_RE     = re.compile(r'^[가-힣]{2,5}$')
 PHONE_RE    = re.compile(r'^(0\d{1,2}[-\s]\d{3,4}[-\s]\d{4}|비공개|[-\d\s/]+)$')
 STATUS_VALS = {"개업", "폐업", "휴업"}
@@ -293,7 +282,36 @@ def make_excel(dfs: dict[str, pd.DataFrame]) -> bytes:
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         for sheet_name, df in dfs.items():
             df.to_excel(writer, sheet_name=sheet_name, index=False)
+            ws = writer.sheets[sheet_name]
+            # 한글 호환 폰트 지정
+            from openpyxl.styles import Font, PatternFill, Alignment
+            header_font  = Font(name="맑은 고딕", bold=True, color="FFFFFF")
+            header_fill  = PatternFill("solid", fgColor="1E3A8A")
+            header_align = Alignment(horizontal="center", vertical="center")
+            cell_font    = Font(name="맑은 고딕", size=10)
+            for cell in ws[1]:
+                cell.font      = header_font
+                cell.fill      = header_fill
+                cell.alignment = header_align
+            for row in ws.iter_rows(min_row=2):
+                for cell in row:
+                    cell.font = cell_font
+            # 컬럼 너비 자동 조정
+            for col in ws.columns:
+                max_len = max((len(str(c.value)) if c.value else 0) for c in col)
+                ws.column_dimensions[col[0].column_letter].width = min(max_len * 2 + 2, 40)
     return buf.getvalue()
+
+
+def make_region_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """지역 / 상세지역별 건수 집계"""
+    summary = (
+        df.groupby(["지역", "상세지역"], sort=False)
+        .size()
+        .reset_index(name="건수")
+    )
+    total = pd.DataFrame([{"지역": "합계", "상세지역": "", "건수": len(df)}])
+    return pd.concat([summary, total], ignore_index=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -304,33 +322,11 @@ st.caption("kacta.or.kr 지역별 세무사 정보 수집 → Google Sheets 날�
 
 # 사이드바
 with st.sidebar:
-    st.header("⚙️ 설정")
     sheet_id = st.text_input(
         "Google Sheets ID",
         value="18ld7dK3aAmJljJRNTtF3_oWi-M007hr9F_FHfYgl0vc",
         help="스프레드시트 URL의 /d/XXXX/ 부분"
     )
-    st.markdown("---")
-    st.markdown("""
-**출력 컬럼 형태**
-
-| 컬럼 | 예시 |
-|------|------|
-| 지역 | 제주 |
-| 상세지역 | 제주 |
-| 이름 | 강경남 |
-| 전화번호 | 064-721-0062 |
-| 현황 | 개업 |
-
----
-
-**동작 순서**
-1. `리스트` 시트 URL 읽기
-2. 전 지역 순차 크롤링
-3. `YYYY-MM-DD` 시트 자동 저장
-4. 직전 시트 대비 신규 항목 감지
-5. 브라우저 출력 + 다운로드
-""")
 
 # 메인 버튼
 col_a, col_b = st.columns([3, 1])
@@ -405,6 +401,21 @@ if run_btn:
         )
         m3.metric("비교 기준 시트", prev_title or "없음 (첫 조회)")
         m4.metric("수집 지역 수", f"{current_df['지역'].nunique()}개")
+
+        # 지역 / 상세지역별 건수
+        st.markdown("**📍 지역 · 상세지역별 건수**")
+        region_summary = make_region_summary(current_df)
+        st.dataframe(
+            region_summary,
+            use_container_width=True,
+            hide_index=True,
+            height=min(36 * len(region_summary) + 38, 420),
+            column_config={
+                "지역":   st.column_config.TextColumn("지역",   width="small"),
+                "상세지역": st.column_config.TextColumn("상세지역", width="small"),
+                "건수":   st.column_config.NumberColumn("건수",  format="%d건"),
+            },
+        )
 
         # 현황별 집계
         status_counts = current_df["현황"].value_counts().reset_index()
@@ -537,6 +548,18 @@ try:
                 hist_df = hist_df[ordered_cols]
 
                 st.caption(f"총 {len(hist_df):,}건")
+
+                # 지역 / 상세지역별 건수
+                with st.expander("📍 지역 · 상세지역별 건수"):
+                    st.dataframe(
+                        make_region_summary(hist_df),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "건수": st.column_config.NumberColumn("건수", format="%d건"),
+                        },
+                    )
+
                 st.dataframe(hist_df, use_container_width=True, height=420, hide_index=True)
 
                 hc1, hc2 = st.columns(2)
