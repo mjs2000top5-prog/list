@@ -1,3 +1,8 @@
+"""
+세무사 정보 크롤러 — kacta.or.kr
+출력 형태: 지역 / 상세지역 / 이름 / 전화번호 / 현황
+"""
+
 import streamlit as st
 import pandas as pd
 import requests
@@ -9,20 +14,19 @@ import time
 import io
 import re
 
+# ── 페이지 설정 ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="세무사 정보 크롤러", page_icon="🔍", layout="wide")
 
 st.markdown("""
 <style>
-.region-chip {
-    display:inline-block; background:#eff6ff; color:#1d4ed8;
-    border:1px solid #bfdbfe; padding:3px 10px; border-radius:20px;
-    margin:2px; font-size:13px;
-}
+[data-testid="stMetricValue"] { font-size: 1.8rem; font-weight: 700; }
+.section-title { font-size: 1.1rem; font-weight: 700; color: #1e3a8a; margin: 4px 0; }
+thead tr th { background: #1e3a8a !important; color: white !important; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ── Google Sheets 연결 ─────────────────────────────────────────────────────────
+# ── Google Sheets 연결 ───────────────────────────────────────────────────────
 @st.cache_resource
 def get_gspread_client():
     creds_dict = st.secrets["gcp_service_account"]
@@ -38,8 +42,9 @@ def get_spreadsheet(client, sheet_id):
     return client.open_by_key(sheet_id)
 
 
-# ── URL 목록 로드 ──────────────────────────────────────────────────────────────
-def load_url_list(spreadsheet):
+# ── URL 목록 로드 ─────────────────────────────────────────────────────────────
+def load_url_list(spreadsheet) -> pd.DataFrame:
+    """리스트 시트에서 지역 / 상세지역 / URL 읽기"""
     try:
         ws = spreadsheet.worksheet("리스트")
     except gspread.exceptions.WorksheetNotFound:
@@ -59,7 +64,7 @@ def load_url_list(spreadsheet):
 
     i_region = find_col(["지역"])
     i_detail = find_col(["상세"])
-    i_url    = find_col(["URL", "url", "주소"])
+    i_url    = find_col(["URL", "url"])
 
     if i_url is None:
         st.error("URL 컬럼을 찾을 수 없습니다.")
@@ -70,110 +75,195 @@ def load_url_list(spreadsheet):
         if len(row) <= i_url or not row[i_url].strip():
             continue
         records.append({
-            "지역":   row[i_region].strip() if i_region is not None else "",
+            "지역":    row[i_region].strip() if i_region is not None else "",
             "상세지역": row[i_detail].strip() if i_detail is not None else "",
-            "URL":   row[i_url].strip(),
+            "URL":    row[i_url].strip(),
         })
     return pd.DataFrame(records)
 
 
-# ── 크롤링 ────────────────────────────────────────────────────────────────────
-PHONE_RE = re.compile(r'0\d{1,2}-\d{3,4}-\d{4}')
-NAME_RE  = re.compile(r'^[가-힣]{2,4}$')
+# ── kacta.or.kr 파서 ─────────────────────────────────────────────────────────
+"""
+사이트 테이블 구조 (실측):
+<table> → <tr> 마다:
+  번호 | 성명 | 전화번호 | 팩스 | 개업구분(현황) | 주소
+
+목표 컬럼: 이름 / 전화번호 / 현황
+  - 이름: 2~4 한글 (성명 컬럼)
+  - 전화번호: 전화번호 컬럼 (비공개 포함)
+  - 현황: 개업 / 폐업 / 휴업 텍스트
+"""
+
+NAME_RE     = re.compile(r'^[가-힣]{2,5}$')
+PHONE_RE    = re.compile(r'^(0\d{1,2}[-\s]\d{3,4}[-\s]\d{4}|비공개|[-\d\s/]+)$')
+STATUS_VALS = {"개업", "폐업", "휴업"}
 
 
-def parse_row(tds: list) -> dict | None:
-    name = office = phone = status = ""
-    for td in tds:
-        text = td.get_text(" ", strip=True)
-        if PHONE_RE.search(text) and not phone:
-            phone = PHONE_RE.search(text).group()
-        elif NAME_RE.match(text) and not name:
-            name = text
-        elif any(kw in text for kw in ["세무", "회계", "사무소", "법인"]) and not office:
-            office = text
-        elif text in ("개업", "폐업", "휴업") and not status:
-            status = text
-    return {"이름": name, "전화번호": phone, "사무소명": office, "현황": status or "개업"} if name and phone else None
+def is_phone(text: str) -> bool:
+    """전화번호 또는 비공개인지 판별"""
+    if text == "비공개":
+        return True
+    # 숫자/하이픈/슬래시로 이뤄진 전화번호 패턴
+    return bool(re.match(r'^0\d', text)) and bool(re.search(r'\d{4}', text))
 
 
-def crawl_one(region, detail, url, session) -> list:
+def parse_kacta_table(soup: BeautifulSoup) -> list[dict]:
+    """
+    kacta.or.kr 테이블 구조 파서.
+    반환: [{"이름": ..., "전화번호": ..., "현황": ...}, ...]
+    """
     results = []
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
-            "Accept-Language": "ko-KR,ko;q=0.9",
-            "Referer": "https://www.kacta.or.kr/",
-        }
-        resp = session.get(url, headers=headers, timeout=20)
-        resp.encoding = "euc-kr"
-        if resp.status_code != 200:
-            return results
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for table in soup.find_all("table"):
-            rows = table.find_all("tr")
-            has_data = False
-            for row in rows:
-                tds = row.find_all("td")
-                if len(tds) < 4:
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        parsed_in_table = []
+
+        for row in rows:
+            tds = row.find_all("td")
+            if len(tds) < 3:
+                continue
+
+            texts = [td.get_text(" ", strip=True) for td in tds]
+
+            name    = ""
+            phone   = ""
+            status  = ""
+
+            for text in texts:
+                if not text:
                     continue
-                parsed = parse_row(tds)
-                if parsed:
-                    has_data = True
-                    results.append({"지역": region, "상세지역": detail, **parsed, "URL": url})
-            if has_data:
-                break
-    except Exception as e:
-        st.warning(f"⚠️ {region} {detail}: {type(e).__name__}")
+                if not name and NAME_RE.match(text):
+                    name = text
+                elif not phone and is_phone(text):
+                    phone = text
+                elif not status and text in STATUS_VALS:
+                    status = text
+
+            if name:
+                parsed_in_table.append({
+                    "이름":    name,
+                    "전화번호": phone if phone else "비공개",
+                    "현황":    status if status else "개업",
+                })
+
+        # 데이터가 있는 첫 번째 테이블만 사용
+        if parsed_in_table:
+            results = parsed_in_table
+            break
+
     return results
 
 
-def crawl_all(url_df, prog, status_text) -> pd.DataFrame:
+def crawl_one(region: str, detail: str, url: str, session: requests.Session) -> list[dict]:
+    """단일 URL 크롤링 → 지역/상세지역 붙여서 반환"""
+    rows = []
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "ko-KR,ko;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": "https://www.kacta.or.kr/",
+            "Connection": "keep-alive",
+        }
+        resp = session.get(url, headers=headers, timeout=25)
+        if resp.status_code != 200:
+            return rows
+        resp.encoding = "euc-kr"
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        parsed = parse_kacta_table(soup)
+
+        for item in parsed:
+            rows.append({
+                "지역":    region,
+                "상세지역": detail,
+                "이름":    item["이름"],
+                "전화번호": item["전화번호"],
+                "현황":    item["현황"],
+            })
+
+    except requests.exceptions.Timeout:
+        st.warning(f"⏱️ 타임아웃: {region} {detail}")
+    except Exception as e:
+        st.warning(f"⚠️ {region} {detail} — {type(e).__name__}: {e}")
+
+    return rows
+
+
+# 결과 컬럼 순서 (샘플 파일과 동일)
+RESULT_COLS = ["지역", "상세지역", "이름", "전화번호", "현황"]
+
+
+def crawl_all(url_df: pd.DataFrame, prog, status_text) -> pd.DataFrame:
     session = requests.Session()
     try:
         session.get("https://www.kacta.or.kr/", timeout=10)
     except Exception:
         pass
 
-    all_data = []
+    all_data: list[dict] = []
     total = len(url_df)
+
     for idx, (_, row) in enumerate(url_df.iterrows()):
         status_text.text(f"🔄 {row['지역']} {row['상세지역']} ({idx+1}/{total})")
         prog.progress((idx + 1) / total)
         all_data.extend(crawl_one(row["지역"], row["상세지역"], row["URL"], session))
-        time.sleep(0.35)
+        time.sleep(0.4)  # 서버 부하 방지
 
-    cols = ["지역", "상세지역", "이름", "전화번호", "사무소명", "현황", "URL"]
-    return pd.DataFrame(all_data) if all_data else pd.DataFrame(columns=cols)
+    return (
+        pd.DataFrame(all_data, columns=RESULT_COLS)
+        if all_data
+        else pd.DataFrame(columns=RESULT_COLS)
+    )
 
 
-# ── 시트 업로드 ───────────────────────────────────────────────────────────────
-def upload_to_sheet(spreadsheet, df, sheet_name):
+# ── Google Sheets 업로드 ──────────────────────────────────────────────────────
+def upload_to_sheet(spreadsheet, df: pd.DataFrame, sheet_name: str):
+    """날짜 이름으로 새 시트 생성 후 데이터 업로드"""
     try:
-        ws = spreadsheet.add_worksheet(title=sheet_name, rows=len(df)+5, cols=len(df.columns)+1)
+        ws = spreadsheet.add_worksheet(
+            title=sheet_name,
+            rows=max(len(df) + 5, 100),
+            cols=len(df.columns) + 1,
+        )
     except gspread.exceptions.APIError:
+        # 이미 존재하면 초기화
         ws = spreadsheet.worksheet(sheet_name)
         ws.clear()
 
-    data = [df.columns.tolist()] + df.fillna("").values.tolist()
+    data = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
     ws.update(data, value_input_option="RAW")
-    ws.format(f"A1:{chr(64+len(df.columns))}1", {
-        "textFormat": {"bold": True, "foregroundColor": {"red":1,"green":1,"blue":1}},
-        "backgroundColor": {"red":0.13,"green":0.25,"blue":0.67},
+
+    # 헤더 스타일 (네이비 배경 + 흰 텍스트 + 볼드 + 가운데)
+    end_col = chr(64 + len(df.columns))
+    ws.format(f"A1:{end_col}1", {
+        "textFormat": {
+            "bold": True,
+            "foregroundColor": {"red": 1, "green": 1, "blue": 1},
+        },
+        "backgroundColor": {"red": 0.12, "green": 0.23, "blue": 0.54},
         "horizontalAlignment": "CENTER",
     })
     return ws
 
 
-# ── 이전 데이터 로드 ──────────────────────────────────────────────────────────
-def load_previous_data(spreadsheet):
-    date_sheets = sorted(
-        [ws.title for ws in spreadsheet.worksheets() if re.match(r"\d{4}-\d{2}-\d{2}", ws.title)]
+# ── 이전 조회 시트 로드 ───────────────────────────────────────────────────────
+def load_date_sheets(spreadsheet) -> list[str]:
+    return sorted(
+        [ws.title for ws in spreadsheet.worksheets()
+         if re.match(r"\d{4}-\d{2}-\d{2}", ws.title)]
     )
-    if len(date_sheets) < 2:
-        return None, (date_sheets[-1] if date_sheets else None)
-    prev_title = date_sheets[-2]
+
+
+def load_previous_data(spreadsheet) -> tuple[pd.DataFrame | None, str | None]:
+    sheets = load_date_sheets(spreadsheet)
+    if len(sheets) < 2:
+        return None, (sheets[-1] if sheets else None)
+    prev_title = sheets[-2]
     records = spreadsheet.worksheet(prev_title).get_all_records()
     return pd.DataFrame(records), prev_title
 
@@ -182,172 +272,347 @@ def load_previous_data(spreadsheet):
 KEY_COLS = ["지역", "상세지역", "이름", "전화번호"]
 
 
-def find_new_entries(current_df, previous_df):
+def find_new_entries(current_df: pd.DataFrame, previous_df: pd.DataFrame | None) -> pd.DataFrame:
     if previous_df is None or previous_df.empty:
         return current_df.copy()
-    prev_set = set(
-        previous_df.reindex(columns=KEY_COLS).fillna("").apply(lambda r: tuple(r.astype(str)), axis=1)
+
+    prev_keys = set(
+        previous_df.reindex(columns=KEY_COLS).fillna("").apply(
+            lambda r: tuple(r.astype(str)), axis=1
+        )
     )
     mask = current_df.reindex(columns=KEY_COLS).fillna("").apply(
-        lambda r: tuple(r.astype(str)) not in prev_set, axis=1
+        lambda r: tuple(r.astype(str)) not in prev_keys, axis=1
     )
     return current_df[mask].copy()
 
 
-# ── UI ────────────────────────────────────────────────────────────────────────
-st.title("🔍 세무사 정보 크롤러")
-st.caption("kacta.or.kr 지역별 세무사 이름·전화번호·현황 수집 → Google Sheets 날짜별 저장 + 신규 비교")
+# ── 다운로드 헬퍼 ─────────────────────────────────────────────────────────────
+def make_excel(dfs: dict[str, pd.DataFrame]) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        for sheet_name, df in dfs.items():
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+    return buf.getvalue()
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UI
+# ═══════════════════════════════════════════════════════════════════════════════
+st.title("🔍 세무사 정보 크롤러")
+st.caption("kacta.or.kr 지역별 세무사 정보 수집 → Google Sheets 날짜별 저장 + 신규 비교")
+
+# 사이드바
 with st.sidebar:
     st.header("⚙️ 설정")
     sheet_id = st.text_input(
         "Google Sheets ID",
         value="18ld7dK3aAmJljJRNTtF3_oWi-M007hr9F_FHfYgl0vc",
+        help="스프레드시트 URL의 /d/XXXX/ 부분"
     )
     st.markdown("---")
-    st.markdown("""**📋 동작 순서**
+    st.markdown("""
+**출력 컬럼 형태**
+
+| 컬럼 | 예시 |
+|------|------|
+| 지역 | 제주 |
+| 상세지역 | 제주 |
+| 이름 | 강경남 |
+| 전화번호 | 064-721-0062 |
+| 현황 | 개업 |
+
+---
+
+**동작 순서**
 1. `리스트` 시트 URL 읽기
-2. 전 지역 크롤링
-3. `YYYY-MM-DD` 시트 자동 생성
-4. 직전 시트 대비 신규 표시
-5. CSV / Excel 다운로드""")
+2. 전 지역 순차 크롤링
+3. `YYYY-MM-DD` 시트 자동 저장
+4. 직전 시트 대비 신규 항목 감지
+5. 브라우저 출력 + 다운로드
+""")
 
-col1, col2 = st.columns([3, 1])
-with col1:
+# 메인 버튼
+col_a, col_b = st.columns([3, 1])
+with col_a:
     run_btn = st.button("🚀 크롤링 시작", type="primary", use_container_width=True)
-with col2:
-    preview_btn = st.button("👁️ URL 미리보기", use_container_width=True)
+with col_b:
+    preview_btn = st.button("👁️ URL 목록", use_container_width=True)
 
+# ── URL 미리보기 ──────────────────────────────────────────────────────────────
 if preview_btn:
-    with st.spinner("연결 중..."):
+    with st.spinner("Google Sheets 연결 중..."):
         try:
             client = get_gspread_client()
             sp = get_spreadsheet(client, sheet_id)
             url_df = load_url_list(sp)
             st.success(f"총 **{len(url_df)}**개 지역 URL 확인")
             c1, c2 = st.columns([1, 2])
-            c1.dataframe(url_df["지역"].value_counts().reset_index().rename(columns={"지역":"지역","count":"구 수"}))
-            c2.dataframe(url_df, use_container_width=True, height=380)
+            summary = url_df.groupby("지역")["상세지역"].count().reset_index()
+            summary.columns = ["지역", "지역구 수"]
+            c1.dataframe(summary, use_container_width=True)
+            c2.dataframe(url_df, use_container_width=True, height=400)
         except Exception as e:
             st.error(f"오류: {e}")
 
+# ── 크롤링 실행 ───────────────────────────────────────────────────────────────
 if run_btn:
     try:
         client = get_gspread_client()
         sp = get_spreadsheet(client, sheet_id)
 
-        with st.spinner("URL 로드 중..."):
+        with st.spinner("URL 목록 로드 중..."):
             url_df = load_url_list(sp)
+
         if url_df.empty:
             st.error("URL 목록이 비어 있습니다.")
             st.stop()
 
-        st.info(f"총 **{len(url_df)}**개 지역 크롤링 시작")
+        st.info(f"총 **{len(url_df)}**개 지역 크롤링 시작합니다.")
+
         st.subheader("📡 크롤링 진행")
         prog = st.progress(0)
-        status = st.empty()
+        status_text = st.empty()
         today = datetime.now().strftime("%Y-%m-%d")
 
-        current_df = crawl_all(url_df, prog, status)
-        status.text(f"✅ 완료 — {len(current_df):,}건 수집")
+        current_df = crawl_all(url_df, prog, status_text)
+        status_text.text(f"✅ 완료 — {len(current_df):,}건 수집")
 
         if current_df.empty:
-            st.error("수집된 데이터가 없습니다.")
+            st.error("수집된 데이터가 없습니다. 사이트 접근 차단 또는 구조 변경을 확인해주세요.")
             st.stop()
 
-        with st.spinner(f"'{today}' 시트 생성 중..."):
+        # Google Sheets 저장
+        with st.spinner(f"'{today}' 시트 저장 중..."):
             upload_to_sheet(sp, current_df, today)
-        st.success(f"✅ '{today}' 시트 저장 ({len(current_df):,}건)")
+        st.success(f"✅ Google Sheets `{today}` 시트 저장 완료 ({len(current_df):,}건)")
 
-        with st.spinner("이전 데이터 비교 중..."):
+        # 이전 데이터 비교
+        with st.spinner("이전 조회와 비교 중..."):
             previous_df, prev_title = load_previous_data(sp)
         new_df = find_new_entries(current_df, previous_df)
 
-        # 요약
+        # ── 요약 지표 ─────────────────────────────────────────────────────
         st.markdown("---")
-        st.subheader("📊 결과 요약")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("총 수집", f"{len(current_df):,}건")
-        m2.metric("🆕 신규", f"{len(new_df):,}건", delta=f"+{len(new_df)}" if new_df is not None else "0")
-        m3.metric("비교 기준 시트", prev_title or "없음")
-        m4.metric("수집 지역", f"{current_df['지역'].nunique()}개")
+        st.subheader("📊 수집 결과")
 
-        # 신규 지역별 출력
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("총 수집 건수", f"{len(current_df):,}건")
+        m2.metric(
+            "🆕 신규 등록",
+            f"{len(new_df):,}건",
+            delta=f"+{len(new_df)}" if len(new_df) > 0 else None,
+        )
+        m3.metric("비교 기준 시트", prev_title or "없음 (첫 조회)")
+        m4.metric("수집 지역 수", f"{current_df['지역'].nunique()}개")
+
+        # 현황별 집계
+        status_counts = current_df["현황"].value_counts().reset_index()
+        status_counts.columns = ["현황", "건수"]
+        with st.expander("현황별 집계 보기"):
+            st.dataframe(status_counts, use_container_width=True)
+
+        # ── 신규 데이터 지역별 출력 ────────────────────────────────────────
+        st.markdown("---")
         if not new_df.empty:
-            st.markdown("---")
             st.subheader(f"🆕 신규 등록 세무사 — {len(new_df):,}건")
+            st.caption(f"비교 기준: `{prev_title}` → `{today}`")
 
             regions_new = new_df["지역"].unique().tolist()
-            if len(regions_new) <= 12:
+
+            if len(regions_new) <= 15:
                 tabs = st.tabs(regions_new)
                 for tab, region in zip(tabs, regions_new):
                     with tab:
                         rdf = new_df[new_df["지역"] == region]
-                        for detail in rdf["상세지역"].unique():
-                            ddf = rdf[rdf["상세지역"] == detail].drop(columns=["URL","지역"], errors="ignore").reset_index(drop=True)
-                            st.markdown(f"**📍 {detail}** — {len(ddf)}건")
-                            st.dataframe(ddf, use_container_width=True)
-            else:
-                st.dataframe(new_df.drop(columns=["URL"], errors="ignore").reset_index(drop=True),
-                             use_container_width=True, height=500)
+                        details = rdf["상세지역"].unique().tolist()
 
-            # 다운로드
+                        for detail in details:
+                            ddf = (
+                                rdf[rdf["상세지역"] == detail]
+                                [["이름", "전화번호", "현황"]]   # 지역/상세지역 이미 탭 제목
+                                .reset_index(drop=True)
+                            )
+                            st.markdown(f"**📍 {detail}** — {len(ddf)}건")
+                            st.dataframe(
+                                ddf,
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "이름":    st.column_config.TextColumn("이름",    width="small"),
+                                    "전화번호": st.column_config.TextColumn("전화번호", width="medium"),
+                                    "현황":    st.column_config.TextColumn("현황",    width="small"),
+                                }
+                            )
+            else:
+                # 지역이 너무 많으면 전체 테이블
+                st.dataframe(
+                    new_df[RESULT_COLS].reset_index(drop=True),
+                    use_container_width=True,
+                    height=520,
+                    hide_index=True,
+                )
+
+            # ── 다운로드 ──────────────────────────────────────────────────
             st.markdown("---")
             st.subheader("⬇️ 다운로드")
+
             dc1, dc2, dc3 = st.columns(3)
-            dc1.download_button("📥 신규 CSV", new_df.to_csv(index=False, encoding="utf-8-sig"),
-                                 f"신규세무사_{today}.csv", "text/csv", use_container_width=True)
-            dc2.download_button("📥 전체 CSV", current_df.to_csv(index=False, encoding="utf-8-sig"),
-                                 f"전체세무사_{today}.csv", "text/csv", use_container_width=True)
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as w:
-                new_df.to_excel(w, sheet_name="신규등록", index=False)
-                current_df.to_excel(w, sheet_name="전체데이터", index=False)
-            dc3.download_button("📥 Excel (신규+전체)", buf.getvalue(),
-                                 f"세무사_{today}.xlsx",
-                                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                 use_container_width=True)
+
+            dc1.download_button(
+                label="📥 신규 데이터 CSV",
+                data=new_df[RESULT_COLS].to_csv(index=False, encoding="utf-8-sig"),
+                file_name=f"신규세무사_{today}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+            dc2.download_button(
+                label="📥 전체 데이터 CSV",
+                data=current_df[RESULT_COLS].to_csv(index=False, encoding="utf-8-sig"),
+                file_name=f"전체세무사_{today}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+            dc3.download_button(
+                label="📥 Excel (신규 + 전체)",
+                data=make_excel({
+                    "신규등록":  new_df[RESULT_COLS],
+                    "전체데이터": current_df[RESULT_COLS],
+                }),
+                file_name=f"세무사_{today}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
         else:
+            # 신규 없음
             if previous_df is not None:
-                st.success("✅ 신규 등록 데이터 없음")
+                st.success("✅ 이전 조회 대비 신규 등록 데이터가 없습니다.")
             else:
-                st.info("📌 첫 조회입니다. 다음 조회부터 신규 비교가 가능합니다.")
-            st.download_button("📥 전체 CSV", current_df.to_csv(index=False, encoding="utf-8-sig"),
-                                f"전체세무사_{today}.csv", "text/csv")
+                st.info("📌 첫 번째 조회입니다. 다음 조회부터 신규 비교가 가능합니다.")
+
+            # 전체 데이터 다운로드만 제공
+            c1, c2 = st.columns(2)
+            c1.download_button(
+                "📥 전체 데이터 CSV",
+                data=current_df[RESULT_COLS].to_csv(index=False, encoding="utf-8-sig"),
+                file_name=f"전체세무사_{today}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+            c2.download_button(
+                "📥 전체 데이터 Excel",
+                data=make_excel({"전체데이터": current_df[RESULT_COLS]}),
+                file_name=f"전체세무사_{today}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
 
     except Exception as e:
-        st.error(f"❌ 오류: {e}")
+        st.error(f"❌ 오류 발생: {e}")
         st.exception(e)
 
 
-# ── 이전 기록 조회 ────────────────────────────────────────────────────────────
+# ── 이전 조회 기록 열람 + 삭제 ───────────────────────────────────────────────
 st.markdown("---")
 st.subheader("📅 이전 조회 기록")
 
 try:
     client = get_gspread_client()
     sp = get_spreadsheet(client, sheet_id)
-    date_sheets = sorted(
-        [ws.title for ws in sp.worksheets() if re.match(r"\d{4}-\d{2}-\d{2}", ws.title)],
-        reverse=True
-    )
+    date_sheets = load_date_sheets(sp)[::-1]  # 최신 순
+
     if date_sheets:
-        selected = st.selectbox("날짜 선택", date_sheets)
-        if st.button("📂 불러오기"):
-            hist_df = pd.DataFrame(sp.worksheet(selected).get_all_records())
-            st.dataframe(hist_df, use_container_width=True, height=400)
-            c1, c2 = st.columns(2)
-            c1.download_button(f"📥 {selected} CSV",
-                                hist_df.to_csv(index=False, encoding="utf-8-sig"),
-                                f"세무사_{selected}.csv", "text/csv", use_container_width=True)
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as w:
-                hist_df.to_excel(w, index=False)
-            c2.download_button(f"📥 {selected} Excel", buf.getvalue(),
-                                f"세무사_{selected}.xlsx",
-                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                use_container_width=True)
+        tab_view, tab_delete = st.tabs(["📂 불러오기", "🗑️ 시트 삭제"])
+
+        # ── 불러오기 탭 ──────────────────────────────────────────────────────
+        with tab_view:
+            selected = st.selectbox("날짜 선택", date_sheets, key="view_select")
+            if st.button("📂 불러오기", key="load_btn"):
+                records = sp.worksheet(selected).get_all_records()
+                hist_df = pd.DataFrame(records)
+                ordered_cols = [c for c in RESULT_COLS if c in hist_df.columns]
+                hist_df = hist_df[ordered_cols]
+
+                st.caption(f"총 {len(hist_df):,}건")
+                st.dataframe(hist_df, use_container_width=True, height=420, hide_index=True)
+
+                hc1, hc2 = st.columns(2)
+                hc1.download_button(
+                    f"📥 {selected} CSV",
+                    data=hist_df.to_csv(index=False, encoding="utf-8-sig"),
+                    file_name=f"세무사_{selected}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+                hc2.download_button(
+                    f"📥 {selected} Excel",
+                    data=make_excel({selected: hist_df}),
+                    file_name=f"세무사_{selected}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+
+        # ── 삭제 탭 ──────────────────────────────────────────────────────────
+        with tab_delete:
+            st.caption("삭제할 시트를 선택하세요. 삭제 후 복구가 불가합니다.")
+
+            to_delete = st.multiselect(
+                "삭제할 날짜 시트 선택",
+                options=date_sheets,
+                placeholder="시트를 선택하세요...",
+                key="delete_select",
+            )
+
+            if to_delete:
+                st.warning(
+                    f"**{len(to_delete)}개** 시트가 삭제됩니다: "
+                    + ", ".join(f"`{s}`" for s in to_delete)
+                )
+
+                # 확인 체크박스 → 버튼 활성화
+                confirmed = st.checkbox(
+                    "위 시트를 영구 삭제하겠습니다. (복구 불가)",
+                    key="delete_confirm",
+                )
+
+                del_btn = st.button(
+                    f"🗑️ {len(to_delete)}개 시트 삭제",
+                    type="primary",
+                    disabled=not confirmed,
+                    key="delete_btn",
+                )
+
+                if del_btn and confirmed:
+                    success, failed = [], []
+                    prog_del = st.progress(0)
+                    for i, sheet_name in enumerate(to_delete):
+                        try:
+                            ws = sp.worksheet(sheet_name)
+                            sp.del_worksheet(ws)
+                            success.append(sheet_name)
+                        except Exception as e:
+                            failed.append(f"{sheet_name} ({e})")
+                        prog_del.progress((i + 1) / len(to_delete))
+
+                    if success:
+                        st.success(
+                            f"✅ 삭제 완료: "
+                            + ", ".join(f"`{s}`" for s in success)
+                        )
+                    if failed:
+                        st.error("❌ 삭제 실패: " + ", ".join(failed))
+
+                    # 캐시 초기화 후 목록 갱신
+                    st.cache_resource.clear()
+                    st.rerun()
+            else:
+                st.info("삭제할 시트를 위에서 선택해주세요.")
+
     else:
-        st.caption("아직 조회 기록이 없습니다.")
+        st.caption("아직 조회 기록이 없습니다. 크롤링을 먼저 실행해주세요.")
+
 except Exception as e:
     st.caption(f"기록 로드 실패: {e}")
