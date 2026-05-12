@@ -1,5 +1,5 @@
 """
-세무사 정보 크롤러 — kacta.or.kr
+개업 세무사 조회
 출력 형태: 지역 / 상세지역 / 이름 / 전화번호 / 현황
 """
 
@@ -15,7 +15,7 @@ import io
 import re
 
 # ── 페이지 설정 ──────────────────────────────────────────────────────────────
-st.set_page_config(page_title="세무사 정보 크롤러", page_icon="🔍", layout="wide")
+st.set_page_config(page_title="개업 세무사 조회", page_icon="🔍", layout="wide")
 
 st.markdown("""
 <style>
@@ -317,7 +317,7 @@ def make_region_summary(df: pd.DataFrame) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════════════════════
 # UI
 # ═══════════════════════════════════════════════════════════════════════════════
-st.title("🔍 세무사 정보 크롤러")
+st.title("🔍 개업 세무사 조회")
 st.caption("kacta.or.kr 지역별 세무사 정보 수집 → Google Sheets 날짜별 저장 + 신규 비교")
 
 # 사이드바
@@ -331,7 +331,7 @@ with st.sidebar:
 # 메인 버튼
 col_a, col_b = st.columns([3, 1])
 with col_a:
-    run_btn = st.button("🚀 크롤링 시작", type="primary", use_container_width=True)
+    run_btn = st.button("🚀 조회 시작", type="primary", use_container_width=True)
 with col_b:
     preview_btn = st.button("👁️ URL 목록", use_container_width=True)
 
@@ -351,7 +351,7 @@ if preview_btn:
         except Exception as e:
             st.error(f"오류: {e}")
 
-# ── 크롤링 실행 ───────────────────────────────────────────────────────────────
+# ── 조회 실행 ───────────────────────────────────────────────────────────────
 if run_btn:
     try:
         client = get_gspread_client()
@@ -364,9 +364,9 @@ if run_btn:
             st.error("URL 목록이 비어 있습니다.")
             st.stop()
 
-        st.info(f"총 **{len(url_df)}**개 지역 크롤링 시작합니다.")
+        st.info(f"총 **{len(url_df)}**개 지역 조회 시작합니다.")
 
-        st.subheader("📡 크롤링 진행")
+        st.subheader("📡 조회 진행")
         prog = st.progress(0)
         status_text = st.empty()
         today = datetime.now().strftime("%Y-%m-%d")
